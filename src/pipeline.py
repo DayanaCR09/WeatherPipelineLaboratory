@@ -122,7 +122,9 @@ async def _get_forecast(
             response.raise_for_status()
             payload = response.json()
             if payload.get("error"):
-                raise RuntimeError(payload.get("reason", "Open-Meteo returned an error"))
+                raise RuntimeError(
+                    payload.get("reason", "Open-Meteo returned an error")
+                )
             return payload
         except Exception as error:
             last_error = error
@@ -265,7 +267,9 @@ def transform(payloads: list[dict], cities: pd.DataFrame) -> pd.DataFrame:
         logger.error("No hourly forecast rows to transform")
         raise ValueError("No hourly forecast rows to transform")
 
-    logger.info("Loaded %d hourly rows from %d JSON payloads", len(hourly), len(payloads))
+    logger.info(
+        "Loaded %d hourly rows from %d JSON payloads", len(hourly), len(payloads)
+    )
 
     daily = hourly.groupby(["city_name", "country", "date"], as_index=False).agg(
         max_temperature=("temperature_2m", "max"),
@@ -429,9 +433,7 @@ def _heat_alerts(df: pd.DataFrame) -> dict:
     }
 
 
-def write_reports(
-    df: pd.DataFrame, directory: Path = REPORTS_DIR
-) -> tuple[Path, Path]:
+def write_reports(df: pd.DataFrame, directory: Path = REPORTS_DIR) -> tuple[Path, Path]:
     """Export the merged DataFrame to formatted Excel and a heat-alert JSON file."""
     directory.mkdir(parents=True, exist_ok=True)
     excel_path = directory / EXCEL_REPORT_NAME
