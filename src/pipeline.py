@@ -36,23 +36,35 @@ _WORD = re.compile(r"[^\W\d_]+")
 logger = logging.getLogger("weather_pipeline")
 
 
-def configure_logging() -> None:
-    """Log to pipeline.log and the console at the level named in .env."""
-    load_dotenv()
-    requested = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+def _level_from_env() -> tuple[int, str, bool]:
+    """Return (level, name, recognized) from LOG_LEVEL in .env. Unknown names fall back to INFO."""
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
+    requested = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
     level = logging.getLevelNamesMapping().get(requested)
-
-    logging.basicConfig(
-        level=level or logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-        force=True,
-    )
-
     if level is None:
+        return logging.INFO, requested, False
+    return level, requested, True
+
+
+def configure_logging() -> None:
+    """Write execution details to pipeline.log (and stderr) at the LOG_LEVEL from .env."""
+    level, requested, known = _level_from_env()
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    if not known:
         logger.error("Unknown LOG_LEVEL %r in .env; falling back to INFO", requested)
     else:
         logger.info("Logging at %s to %s", requested, LOG_FILE)
