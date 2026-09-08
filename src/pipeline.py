@@ -1,10 +1,12 @@
 """Weather data pipeline: fetch, transform, and export."""
 
 import asyncio
+import json
 import logging
 import os
 import ssl
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -23,6 +25,9 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 FORECAST_TIMEOUT = 30.0
 HOURLY_VARIABLES = ("temperature_2m", "precipitation")
 TEMPERATURE_UNITS = frozenset({"celsius", "fahrenheit"})
+HEAT_ALERT_THRESHOLD_C = 30.0
+EXCEL_REPORT_NAME = "weather_report.xlsx"
+ALERT_REPORT_NAME = "heat_alerts.json"
 
 logger = logging.getLogger("weather_pipeline")
 
@@ -290,9 +295,166 @@ def transform(payloads: list[dict], cities: pd.DataFrame) -> pd.DataFrame:
     return mapped
 
 
+def _excel_rows(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.rename(
+        columns={
+            "city_name": "City",
+            "country": "Country",
+            "latitude": "Latitude",
+            "longitude": "Longitude",
+            "date": "Date",
+            "max_temperature": "Max Temperature (°C)",
+            "precipitation_sum": "Precipitation Sum",
+        }
+    )
+    if "Date" in display.columns:
+        display["Date"] = pd.to_datetime(display["Date"], errors="coerce").dt.date
+    return display
+
+
+def _write_excel(df: pd.DataFrame, path: Path) -> None:
+    """Write a formatted workbook with heat-alert rows highlighted."""
+    from openpyxl.formatting.rule import CellIsRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    display = _excel_rows(df)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        display.to_excel(writer, index=False, sheet_name="Daily Forecast")
+        sheet = writer.sheets["Daily Forecast"]
+
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="1F4E79")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin = Border(
+            left=Side(style="thin", color="D9D9D9"),
+            right=Side(style="thin", color="D9D9D9"),
+            top=Side(style="thin", color="D9D9D9"),
+            bottom=Side(style="thin", color="D9D9D9"),
+        )
+        alert_fill = PatternFill("solid", fgColor="F4C7C3")
+
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.row_dimensions[1].height = 22
+
+        temp_column = None
+        headers: dict[str, str] = {}
+        for index, cell in enumerate(sheet[1], start=1):
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+            cell.border = thin
+            letter = get_column_letter(index)
+            header = str(cell.value or "")
+            headers[letter] = header
+            width = min(max(len(header) + 4, 14), 28)
+            sheet.column_dimensions[letter].width = width
+            if header.startswith("Max Temperature"):
+                temp_column = letter
+
+        for row in sheet.iter_rows(
+            min_row=2, max_row=sheet.max_row, max_col=sheet.max_column
+        ):
+            for cell in row:
+                cell.border = thin
+                cell.alignment = Alignment(vertical="center")
+                header = headers.get(cell.column_letter, "")
+                if header == "Date":
+                    cell.number_format = "YYYY-MM-DD"
+                elif header in {
+                    "Latitude",
+                    "Longitude",
+                    "Max Temperature (°C)",
+                    "Precipitation Sum",
+                }:
+                    cell.number_format = "0.0"
+
+        if temp_column and sheet.max_row >= 2:
+            sheet.conditional_formatting.add(
+                f"{temp_column}2:{temp_column}{sheet.max_row}",
+                CellIsRule(
+                    operator="greaterThan",
+                    formula=[str(HEAT_ALERT_THRESHOLD_C)],
+                    fill=alert_fill,
+                ),
+            )
+
+
+def _iso_date(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    stamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(stamp):
+        return None
+    return stamp.strftime("%Y-%m-%d")
+
+
+def _heat_alerts(df: pd.DataFrame) -> dict:
+    """Build a simplified alert payload for cities whose daily max exceeds 30°C."""
+    hot = df.loc[df["max_temperature"] > HEAT_ALERT_THRESHOLD_C].copy()
+    if hot.empty:
+        cities: list[dict] = []
+    else:
+        grouped = (
+            hot.groupby(["city_name", "country"], as_index=False)
+            .agg(
+                max_temperature=("max_temperature", "max"),
+                days_over_threshold=("date", "count"),
+                first_alert_date=("date", "min"),
+                last_alert_date=("date", "max"),
+            )
+            .sort_values("max_temperature", ascending=False)
+        )
+        cities = []
+        for row in grouped.to_dict("records"):
+            cities.append(
+                {
+                    "city_name": row["city_name"],
+                    "country": row["country"],
+                    "max_temperature": round(float(row["max_temperature"]), 1),
+                    "days_over_threshold": int(row["days_over_threshold"]),
+                    "first_alert_date": _iso_date(row["first_alert_date"]),
+                    "last_alert_date": _iso_date(row["last_alert_date"]),
+                }
+            )
+    return {
+        "alert_type": "heat",
+        "threshold_c": HEAT_ALERT_THRESHOLD_C,
+        "comparison": "greater_than",
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "city_count": len(cities),
+        "cities": cities,
+    }
+
+
+def write_reports(
+    df: pd.DataFrame, directory: Path = REPORTS_DIR
+) -> tuple[Path, Path]:
+    """Export the merged DataFrame to formatted Excel and a heat-alert JSON file."""
+    directory.mkdir(parents=True, exist_ok=True)
+    excel_path = directory / EXCEL_REPORT_NAME
+    json_path = directory / ALERT_REPORT_NAME
+    _write_excel(df, excel_path)
+    payload = _heat_alerts(df)
+    json_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("Wrote formatted Excel report to %s", excel_path)
+    logger.info(
+        "Wrote %d heat alerts (>%s°C) to %s",
+        payload["city_count"],
+        HEAT_ALERT_THRESHOLD_C,
+        json_path,
+    )
+    return excel_path, json_path
+
+
 def export(df: pd.DataFrame, path: Path) -> None:
     """Write the transformed data to an Excel report."""
-    df.to_excel(path, index=False)
+    _write_excel(df, path)
 
 
 async def main() -> None:
@@ -318,12 +480,12 @@ async def main() -> None:
     except Exception:
         logger.exception("Pipeline aborted while transforming forecasts")
         raise
-    logger.info(
-        "Report columns %s; date dtype %s",
-        list(report.columns),
-        report["date"].dtype,
-    )
-    logger.info("Pipeline run finished with %d city-day rows", len(report))
+    try:
+        excel_path, alert_path = write_reports(report)
+    except Exception:
+        logger.exception("Pipeline aborted while writing reports")
+        raise
+    logger.info("Pipeline run finished (%s, %s)", excel_path.name, alert_path.name)
 
 
 if __name__ == "__main__":
