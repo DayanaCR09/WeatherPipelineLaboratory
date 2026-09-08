@@ -3,173 +3,291 @@
 import asyncio
 import logging
 import os
-import re
-import unicodedata
+import ssl
+import time
 from pathlib import Path
 
 import httpx
 import pandas as pd
+import truststore
 from dotenv import load_dotenv
+
+from cities import load_cities
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 REPORTS_DIR = PROJECT_ROOT / "reports"
-RAW_CITIES = DATA_DIR / "raw_cities.csv"
 LOG_FILE = PROJECT_ROOT / "pipeline.log"
 
-REQUIRED_COLUMNS = ("city_name", "country", "latitude", "longitude")
-LATITUDE_RANGE = (-90.0, 90.0)
-LONGITUDE_RANGE = (-180.0, 180.0)
-
-# Spellings that title-casing alone cannot repair.
-COUNTRY_ALIASES = {
-    "us": "United States",
-    "usa": "United States",
-    "uk": "United Kingdom",
-}
-
-_ALIAS_IN_PARENS = re.compile(r"\s*\([^)]*\)")
-_NOISE = re.compile(r"[\d_]|[^\w\s'\-]")
-_WHITESPACE = re.compile(r"\s+")
-_WORD = re.compile(r"[^\W\d_]+")
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+FORECAST_TIMEOUT = 30.0
+HOURLY_VARIABLES = ("temperature_2m", "precipitation")
+TEMPERATURE_UNITS = frozenset({"celsius", "fahrenheit"})
 
 logger = logging.getLogger("weather_pipeline")
 
 
-def configure_logging() -> None:
-    """Log to pipeline.log and the console at the level named in .env."""
-    load_dotenv()
-    requested = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+def _level_from_env() -> tuple[int, str, bool]:
+    """Return (level, name, recognized) from LOG_LEVEL in .env. Unknown names fall back to INFO."""
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
+    requested = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
     level = logging.getLevelNamesMapping().get(requested)
-
-    logging.basicConfig(
-        level=level or logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-        force=True,
-    )
-
     if level is None:
+        return logging.INFO, requested, False
+    return level, requested, True
+
+
+def configure_logging() -> None:
+    """Write execution details to pipeline.log (and stderr) at the LOG_LEVEL from .env."""
+    level, requested, known = _level_from_env()
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    if not known:
         logger.error("Unknown LOG_LEVEL %r in .env; falling back to INFO", requested)
     else:
         logger.info("Logging at %s to %s", requested, LOG_FILE)
 
 
-def _title_case(value: str) -> str:
-    """Capitalize each word, leaving accents and non-Latin scripts intact."""
-    return _WORD.sub(lambda match: match.group().capitalize(), value)
+def _temperature_unit() -> str:
+    unit = os.getenv("WEATHER_UNIT", "celsius").strip().lower() or "celsius"
+    if unit not in TEMPERATURE_UNITS:
+        logger.error("Unknown WEATHER_UNIT %r in .env; falling back to celsius", unit)
+        return "celsius"
+    return unit
 
 
-def normalize_city(raw: str) -> str:
-    """Reduce a messy city field to a single title-cased name."""
-    name = unicodedata.normalize("NFC", str(raw))
-    name = name.split(",")[0]  # "mexico city, cdmx"
-    name = name.split("/")[0]  # "bei jing / 北京"
-    name = _ALIAS_IN_PARENS.sub("", name)  # "mumbai (bombay)"
-    name = _NOISE.sub("", name)  # "sydney***", "seoul#1"
-    name = _WHITESPACE.sub(" ", name).strip(" -'")
-    return _title_case(name)
-
-
-def normalize_country(raw: str) -> str:
-    """Collapse spacing and casing, expanding known abbreviations."""
-    country = unicodedata.normalize("NFC", str(raw))
-    country = _WHITESPACE.sub(" ", country).strip()
-    alias = COUNTRY_ALIASES.get(country.casefold().replace(".", ""))
-    if alias:
-        return alias
-    return _title_case(_NOISE.sub("", country)).strip()
-
-
-def normalize_column(name: str) -> str:
-    """Turn a header such as ' LONGITUDE' into 'longitude'."""
-    return re.sub(r"\W+", "_", name.strip()).strip("_").lower()
-
-
-def _parse_coordinate(value: str, field: str, bounds: tuple[float, float]) -> float:
+def _max_retries() -> int:
+    raw = os.getenv("MAX_RETRIES", "3").strip() or "3"
     try:
-        number = float(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{field} is not numeric ({value!r})") from error
-    low, high = bounds
-    if not low <= number <= high:
-        raise ValueError(f"{field} {number} is outside [{low}, {high}]")
-    return number
+        value = int(raw)
+    except ValueError:
+        logger.error("Invalid MAX_RETRIES %r in .env; falling back to 3", raw)
+        return 3
+    if value < 1:
+        logger.error("MAX_RETRIES must be >= 1; falling back to 3")
+        return 3
+    return value
 
 
-def load_cities(path: Path = RAW_CITIES) -> pd.DataFrame:
-    """Read the raw city CSV and return a normalized, validated DataFrame."""
-    logger.info("Reading raw city data from %s", path)
-    try:
-        frame = pd.read_csv(path, dtype=str, skipinitialspace=True)
-    except FileNotFoundError:
-        logger.error("Raw city file is missing: %s", path)
-        raise
-    except pd.errors.ParserError:
-        logger.error("Raw city file is malformed and could not be parsed: %s", path)
-        raise
+def _forecast_params(latitude: float, longitude: float) -> dict[str, float | str]:
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": ",".join(HOURLY_VARIABLES),
+        "timezone": "auto",
+        "temperature_unit": _temperature_unit(),
+    }
 
-    frame.columns = [normalize_column(column) for column in frame.columns]
-    missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
-    if missing:
-        logger.error("Missing required columns: %s", ", ".join(missing))
-        raise KeyError(f"Missing required columns: {', '.join(missing)}")
 
-    logger.info("Read %d raw rows", len(frame))
+def _is_retryable(error: BaseException) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status == 429 or status >= 500
+    return isinstance(error, httpx.RequestError)
 
-    records = []
-    for line, row in enumerate(frame.to_dict("records"), start=2):
-        city = normalize_city(row["city_name"])
-        if not city:
-            logger.error(
-                "Line %d: city name is empty after normalization (%r)",
-                line,
-                row["city_name"],
-            )
-            continue
+
+async def _get_forecast(
+    client: httpx.AsyncClient, city: str, params: dict[str, float | str]
+) -> dict:
+    """GET /v1/forecast, retrying transient failures up to MAX_RETRIES."""
+    attempts = _max_retries()
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
         try:
-            latitude = _parse_coordinate(row["latitude"], "latitude", LATITUDE_RANGE)
-            longitude = _parse_coordinate(
-                row["longitude"], "longitude", LONGITUDE_RANGE
+            response = await client.get(FORECAST_URL, params=params)
+            if response.status_code == 400:
+                try:
+                    reason = response.json().get("reason", response.text)
+                except ValueError:
+                    reason = response.text
+                raise RuntimeError(f"Open-Meteo rejected {city}: {reason}")
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(payload.get("reason", "Open-Meteo returned an error"))
+            return payload
+        except Exception as error:
+            last_error = error
+            if not _is_retryable(error):
+                logger.error("%s: forecast request failed (%s)", city, error)
+                raise
+            logger.warning(
+                "%s: forecast attempt %d/%d failed (%s)",
+                city,
+                attempt,
+                attempts,
+                error,
             )
-        except ValueError as error:
-            logger.error("Line %d (%s): %s", line, city, error)
-            continue
+            if attempt < attempts:
+                await asyncio.sleep(min(2 ** (attempt - 1), 8))
+    logger.error("%s: giving up after %d attempts", city, attempts)
+    raise last_error if last_error else RuntimeError(f"No forecast for {city}")
 
-        logger.debug("Line %d: %r -> %r", line, row["city_name"], city)
-        records.append(
-            {
-                "city_name": city,
-                "country": normalize_country(row["country"]),
-                "latitude": latitude,
-                "longitude": longitude,
-            }
+
+async def _fetch_city(client: httpx.AsyncClient, row: dict) -> dict:
+    city = row["city_name"]
+    params = _forecast_params(row["latitude"], row["longitude"])
+    logger.info(
+        "Requesting hourly forecast for %s (%s) at %s, %s",
+        city,
+        row["country"],
+        row["latitude"],
+        row["longitude"],
+    )
+    payload = await _get_forecast(client, city, params)
+    hourly = payload.get("hourly") or {}
+    hours = hourly.get("time") or []
+    logger.info("%s: received %d hourly points", city, len(hours))
+    payload["city_name"] = city
+    payload["country"] = row["country"]
+    return payload
+
+
+async def fetch(client: httpx.AsyncClient, cities: pd.DataFrame) -> list[dict]:
+    """Request hourly forecasts from Open-Meteo one city at a time."""
+    if cities.empty:
+        logger.error("No cities available to fetch forecasts for")
+        raise ValueError("No cities available to fetch forecasts for")
+
+    unit = _temperature_unit()
+    logger.info(
+        "Fetching Open-Meteo hourly forecasts sequentially for %d cities (%s) from %s",
+        len(cities),
+        unit,
+        FORECAST_URL,
+    )
+    started = time.perf_counter()
+    payloads: list[dict] = []
+    for row in cities.to_dict("records"):
+        try:
+            payloads.append(await _fetch_city(client, row))
+        except (httpx.HTTPError, RuntimeError, ValueError, OSError) as error:
+            logger.error("Failed to fetch forecast for %s: %s", row["city_name"], error)
+
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "Sequential fetch of %d cities finished in %.3f seconds (%d succeeded)",
+        len(cities),
+        elapsed,
+        len(payloads),
+    )
+    if not payloads:
+        raise RuntimeError("No forecasts were retrieved from Open-Meteo")
+    return payloads
+
+
+def _pad_series(values: object, length: int) -> list:
+    items = list(values or [])
+    if len(items) < length:
+        items = items + [None] * (length - len(items))
+    return items[:length]
+
+
+def _hourly_frame(payload: dict) -> pd.DataFrame:
+    """Parse one Open-Meteo JSON body into an hourly DataFrame."""
+    city = payload.get("city_name", "unknown")
+    hourly = payload.get("hourly") or {}
+    times = list(hourly.get("time") or [])
+    empty = pd.DataFrame(
+        columns=[
+            "city_name",
+            "country",
+            "time",
+            "date",
+            "temperature_2m",
+            "precipitation",
+        ]
+    )
+    if not times:
+        logger.warning("%s: hourly forecast has no timestamps", city)
+        return empty
+
+    frame = pd.DataFrame(
+        {
+            "time": times,
+            "temperature_2m": _pad_series(hourly.get("temperature_2m"), len(times)),
+            "precipitation": _pad_series(hourly.get("precipitation"), len(times)),
+        }
+    )
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    invalid_times = int(frame["time"].isna().sum())
+    if invalid_times:
+        logger.warning(
+            "%s: dropping %d hourly rows with invalid timestamps", city, invalid_times
+        )
+        frame = frame.dropna(subset=["time"])
+    if frame.empty:
+        return empty
+
+    frame["temperature_2m"] = pd.to_numeric(frame["temperature_2m"], errors="coerce")
+    frame["precipitation"] = pd.to_numeric(frame["precipitation"], errors="coerce")
+    missing_temp = int(frame["temperature_2m"].isna().sum())
+    missing_precip = int(frame["precipitation"].isna().sum())
+    if missing_temp or missing_precip:
+        logger.warning(
+            "%s: %d missing temperatures, %d missing precipitation values",
+            city,
+            missing_temp,
+            missing_precip,
         )
 
-    cleaned = pd.DataFrame.from_records(records, columns=list(REQUIRED_COLUMNS))
-    duplicates = cleaned.duplicated(subset=["city_name", "country"])
-    if duplicates.any():
-        logger.warning("Discarding %d duplicate cities", int(duplicates.sum()))
-        cleaned = cleaned[~duplicates].reset_index(drop=True)
-
-    rejected = len(frame) - len(cleaned)
-    if rejected:
-        logger.warning("Rejected %d of %d rows", rejected, len(frame))
-    logger.info("Normalized %d cities", len(cleaned))
-    return cleaned
+    frame["date"] = frame["time"].dt.normalize()
+    frame["city_name"] = city
+    frame["country"] = payload.get("country")
+    return frame[
+        ["city_name", "country", "time", "date", "temperature_2m", "precipitation"]
+    ]
 
 
-async def fetch(client: httpx.AsyncClient) -> dict:
-    """Retrieve raw weather data from the source API."""
-    raise NotImplementedError
+def transform(payloads: list[dict], cities: pd.DataFrame) -> pd.DataFrame:
+    """Load hourly forecasts, aggregate per city-day, and join CSV city names."""
+    frames = [_hourly_frame(payload) for payload in payloads]
+    hourly = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if hourly.empty:
+        logger.error("No hourly forecast rows to transform")
+        raise ValueError("No hourly forecast rows to transform")
 
+    logger.info("Loaded %d hourly rows from %d JSON payloads", len(hourly), len(payloads))
 
-def transform(payload: dict) -> pd.DataFrame:
-    """Normalize the raw payload into a tabular form."""
-    raise NotImplementedError
+    daily = hourly.groupby(["city_name", "country", "date"], as_index=False).agg(
+        max_temperature=("temperature_2m", "max"),
+        precipitation_sum=("precipitation", "sum"),
+    )
+    logger.info(
+        "Aggregated max temperature and precipitation sum into %d city-day rows",
+        len(daily),
+    )
+
+    mapped = cities.merge(daily, on=["city_name", "country"], how="left")
+    unmatched = mapped.loc[mapped["date"].isna(), "city_name"]
+    if not unmatched.empty:
+        logger.warning(
+            "No weather stats for %d cities: %s",
+            unmatched.nunique(),
+            ", ".join(unmatched.dropna().unique()),
+        )
+
+    mapped = mapped.sort_values(["city_name", "date"], na_position="last").reset_index(
+        drop=True
+    )
+    logger.info(
+        "Joined normalized CSV city names onto %d aggregated weather rows",
+        int(mapped["date"].notna().sum()),
+    )
+    return mapped
 
 
 def export(df: pd.DataFrame, path: Path) -> None:
@@ -185,7 +303,27 @@ async def main() -> None:
     except Exception:
         logger.exception("Pipeline aborted while loading city data")
         raise
-    logger.info("Pipeline run finished with %d cities ready to fetch", len(cities))
+    try:
+        async with httpx.AsyncClient(
+            timeout=FORECAST_TIMEOUT,
+            headers={"User-Agent": "WeatherPipelineLaboratory/0.1"},
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        ) as client:
+            forecasts = await fetch(client, cities)
+    except Exception:
+        logger.exception("Pipeline aborted while fetching forecasts")
+        raise
+    try:
+        report = transform(forecasts, cities)
+    except Exception:
+        logger.exception("Pipeline aborted while transforming forecasts")
+        raise
+    logger.info(
+        "Report columns %s; date dtype %s",
+        list(report.columns),
+        report["date"].dtype,
+    )
+    logger.info("Pipeline run finished with %d city-day rows", len(report))
 
 
 if __name__ == "__main__":
