@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import ssl
+import time
 from pathlib import Path
 
 import httpx
@@ -20,21 +21,7 @@ LOG_FILE = PROJECT_ROOT / "pipeline.log"
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 FORECAST_TIMEOUT = 30.0
-FORECAST_CONCURRENCY = 8
-CURRENT_VARIABLES = (
-    "temperature_2m",
-    "relative_humidity_2m",
-    "apparent_temperature",
-    "precipitation",
-    "weather_code",
-    "wind_speed_10m",
-)
-DAILY_VARIABLES = (
-    "temperature_2m_max",
-    "temperature_2m_min",
-    "precipitation_sum",
-    "weather_code",
-)
+HOURLY_VARIABLES = ("temperature_2m", "precipitation")
 TEMPERATURE_UNITS = frozenset({"celsius", "fahrenheit"})
 
 logger = logging.getLogger("weather_pipeline")
@@ -99,8 +86,7 @@ def _forecast_params(latitude: float, longitude: float) -> dict[str, float | str
     return {
         "latitude": latitude,
         "longitude": longitude,
-        "current": ",".join(CURRENT_VARIABLES),
-        "daily": ",".join(DAILY_VARIABLES),
+        "hourly": ",".join(HOURLY_VARIABLES),
         "timezone": "auto",
         "temperature_unit": _temperature_unit(),
     }
@@ -151,61 +137,53 @@ async def _get_forecast(
     raise last_error if last_error else RuntimeError(f"No forecast for {city}")
 
 
-async def _fetch_city(
-    client: httpx.AsyncClient,
-    row: dict,
-    semaphore: asyncio.Semaphore,
-) -> dict:
+async def _fetch_city(client: httpx.AsyncClient, row: dict) -> dict:
     city = row["city_name"]
     params = _forecast_params(row["latitude"], row["longitude"])
     logger.info(
-        "Requesting forecast for %s (%s) at %s, %s",
+        "Requesting hourly forecast for %s (%s) at %s, %s",
         city,
         row["country"],
         row["latitude"],
         row["longitude"],
     )
-    async with semaphore:
-        payload = await _get_forecast(client, city, params)
-    current = payload.get("current") or {}
-    temperature = current.get("temperature_2m")
-    unit = (payload.get("current_units") or {}).get("temperature_2m", "")
-    logger.info("%s: current temperature %s %s", city, temperature, unit)
+    payload = await _get_forecast(client, city, params)
+    hourly = payload.get("hourly") or {}
+    hours = hourly.get("time") or []
+    logger.info("%s: received %d hourly points", city, len(hours))
     payload["city_name"] = city
     payload["country"] = row["country"]
     return payload
 
 
 async def fetch(client: httpx.AsyncClient, cities: pd.DataFrame) -> list[dict]:
-    """Retrieve current and daily forecasts from Open-Meteo for each city."""
+    """Request hourly forecasts from Open-Meteo one city at a time."""
     if cities.empty:
         logger.error("No cities available to fetch forecasts for")
         raise ValueError("No cities available to fetch forecasts for")
 
     unit = _temperature_unit()
     logger.info(
-        "Fetching Open-Meteo forecasts for %d cities (%s) from %s",
+        "Fetching Open-Meteo hourly forecasts sequentially for %d cities (%s) from %s",
         len(cities),
         unit,
         FORECAST_URL,
     )
-    semaphore = asyncio.Semaphore(FORECAST_CONCURRENCY)
-    results = await asyncio.gather(
-        *(
-            _fetch_city(client, row, semaphore)
-            for row in cities.to_dict("records")
-        ),
-        return_exceptions=True,
-    )
-
+    started = time.perf_counter()
     payloads: list[dict] = []
-    for row, result in zip(cities.to_dict("records"), results, strict=True):
-        if isinstance(result, Exception):
-            logger.error("Failed to fetch forecast for %s: %s", row["city_name"], result)
-            continue
-        payloads.append(result)
+    for row in cities.to_dict("records"):
+        try:
+            payloads.append(await _fetch_city(client, row))
+        except (httpx.HTTPError, RuntimeError, ValueError, OSError) as error:
+            logger.error("Failed to fetch forecast for %s: %s", row["city_name"], error)
 
-    logger.info("Fetched %d of %d forecasts", len(payloads), len(cities))
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "Sequential fetch of %d cities finished in %.3f seconds (%d succeeded)",
+        len(cities),
+        elapsed,
+        len(payloads),
+    )
     if not payloads:
         raise RuntimeError("No forecasts were retrieved from Open-Meteo")
     return payloads
