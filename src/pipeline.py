@@ -189,9 +189,105 @@ async def fetch(client: httpx.AsyncClient, cities: pd.DataFrame) -> list[dict]:
     return payloads
 
 
-def transform(payload: dict) -> pd.DataFrame:
-    """Normalize the raw payload into a tabular form."""
-    raise NotImplementedError
+def _pad_series(values: object, length: int) -> list:
+    items = list(values or [])
+    if len(items) < length:
+        items = items + [None] * (length - len(items))
+    return items[:length]
+
+
+def _hourly_frame(payload: dict) -> pd.DataFrame:
+    """Parse one Open-Meteo JSON body into an hourly DataFrame."""
+    city = payload.get("city_name", "unknown")
+    hourly = payload.get("hourly") or {}
+    times = list(hourly.get("time") or [])
+    empty = pd.DataFrame(
+        columns=[
+            "city_name",
+            "country",
+            "time",
+            "date",
+            "temperature_2m",
+            "precipitation",
+        ]
+    )
+    if not times:
+        logger.warning("%s: hourly forecast has no timestamps", city)
+        return empty
+
+    frame = pd.DataFrame(
+        {
+            "time": times,
+            "temperature_2m": _pad_series(hourly.get("temperature_2m"), len(times)),
+            "precipitation": _pad_series(hourly.get("precipitation"), len(times)),
+        }
+    )
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    invalid_times = int(frame["time"].isna().sum())
+    if invalid_times:
+        logger.warning(
+            "%s: dropping %d hourly rows with invalid timestamps", city, invalid_times
+        )
+        frame = frame.dropna(subset=["time"])
+    if frame.empty:
+        return empty
+
+    frame["temperature_2m"] = pd.to_numeric(frame["temperature_2m"], errors="coerce")
+    frame["precipitation"] = pd.to_numeric(frame["precipitation"], errors="coerce")
+    missing_temp = int(frame["temperature_2m"].isna().sum())
+    missing_precip = int(frame["precipitation"].isna().sum())
+    if missing_temp or missing_precip:
+        logger.warning(
+            "%s: %d missing temperatures, %d missing precipitation values",
+            city,
+            missing_temp,
+            missing_precip,
+        )
+
+    frame["date"] = frame["time"].dt.normalize()
+    frame["city_name"] = city
+    frame["country"] = payload.get("country")
+    return frame[
+        ["city_name", "country", "time", "date", "temperature_2m", "precipitation"]
+    ]
+
+
+def transform(payloads: list[dict], cities: pd.DataFrame) -> pd.DataFrame:
+    """Load hourly forecasts, aggregate per city-day, and join CSV city names."""
+    frames = [_hourly_frame(payload) for payload in payloads]
+    hourly = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if hourly.empty:
+        logger.error("No hourly forecast rows to transform")
+        raise ValueError("No hourly forecast rows to transform")
+
+    logger.info("Loaded %d hourly rows from %d JSON payloads", len(hourly), len(payloads))
+
+    daily = hourly.groupby(["city_name", "country", "date"], as_index=False).agg(
+        max_temperature=("temperature_2m", "max"),
+        precipitation_sum=("precipitation", "sum"),
+    )
+    logger.info(
+        "Aggregated max temperature and precipitation sum into %d city-day rows",
+        len(daily),
+    )
+
+    mapped = cities.merge(daily, on=["city_name", "country"], how="left")
+    unmatched = mapped.loc[mapped["date"].isna(), "city_name"]
+    if not unmatched.empty:
+        logger.warning(
+            "No weather stats for %d cities: %s",
+            unmatched.nunique(),
+            ", ".join(unmatched.dropna().unique()),
+        )
+
+    mapped = mapped.sort_values(["city_name", "date"], na_position="last").reset_index(
+        drop=True
+    )
+    logger.info(
+        "Joined normalized CSV city names onto %d aggregated weather rows",
+        int(mapped["date"].notna().sum()),
+    )
+    return mapped
 
 
 def export(df: pd.DataFrame, path: Path) -> None:
@@ -217,7 +313,17 @@ async def main() -> None:
     except Exception:
         logger.exception("Pipeline aborted while fetching forecasts")
         raise
-    logger.info("Pipeline run finished with %d forecasts ready to transform", len(forecasts))
+    try:
+        report = transform(forecasts, cities)
+    except Exception:
+        logger.exception("Pipeline aborted while transforming forecasts")
+        raise
+    logger.info(
+        "Report columns %s; date dtype %s",
+        list(report.columns),
+        report["date"].dtype,
+    )
+    logger.info("Pipeline run finished with %d city-day rows", len(report))
 
 
 if __name__ == "__main__":
